@@ -42,7 +42,8 @@ func walkNode(n *Node, f func(n *Node)) {
 	}
 }
 
-// Transform the tree.
+// prepareTree transform the tree in-place. It also returns a map of map from
+// names and oids to nodes.
 func prepareTree(nodes *Node, logger *slog.Logger) map[string]*Node {
 	// Build a map from names and oids to nodes.
 	nameToNode := map[string]*Node{}
@@ -139,6 +140,9 @@ func prepareTree(nodes *Node, logger *slog.Logger) map[string]*Node {
 		if n.TextualConvention == "NTPTimeStamp" {
 			n.Type = "NTPTimeStamp"
 		}
+		if n.TextualConvention == "ParseFloatString" {
+			n.Type = "ParseFloatString"
+		}
 		// Convert RFC 4001 InetAddress types textual convention to type.
 		if n.TextualConvention == "InetAddressIPv4" || n.TextualConvention == "InetAddressIPv6" || n.TextualConvention == "InetAddress" {
 			n.Type = n.TextualConvention
@@ -172,6 +176,8 @@ func metricType(t string) (string, bool) {
 	case "DateAndTime":
 		return t, true
 	case "ParseDateAndTime":
+		return t, true
+	case "ParseFloatString":
 		return t, true
 	case "NTPTimeStamp":
 		return t, true

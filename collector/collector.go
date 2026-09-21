@@ -19,7 +19,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -354,15 +356,15 @@ func (c Collector) collect(ch chan<- prometheus.Metric, logger *slog.Logger, cli
 		// Set the metrics options.
 		func(g *gosnmp.GoSNMP) {
 			var sent time.Time
-			g.OnSent = func(x *gosnmp.GoSNMP) {
+			g.OnSent = func(_ *gosnmp.GoSNMP) {
 				sent = time.Now()
 				c.metrics.SNMPPackets.Inc()
 				packets++
 			}
-			g.OnRecv = func(x *gosnmp.GoSNMP) {
+			g.OnRecv = func(_ *gosnmp.GoSNMP) {
 				c.metrics.SNMPDuration.Observe(time.Since(sent).Seconds())
 			}
-			g.OnRetry = func(x *gosnmp.GoSNMP) {
+			g.OnRetry = func(_ *gosnmp.GoSNMP) {
 				c.metrics.SNMPRetries.Inc()
 				retries++
 			}
@@ -393,19 +395,23 @@ func (c Collector) collect(ch chan<- prometheus.Metric, logger *slog.Logger, cli
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("snmp_scrape_walk_duration_seconds", "Time SNMP walk/bulkwalk took.", nil, moduleLabel),
 		prometheus.GaugeValue,
-		time.Since(start).Seconds())
+		time.Since(start).Seconds(),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("snmp_scrape_packets_sent", "Packets sent for get, bulkget, and walk; including retries.", nil, moduleLabel),
 		prometheus.GaugeValue,
-		float64(packets))
+		float64(packets),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("snmp_scrape_packets_retried", "Packets retried for get, bulkget, and walk.", nil, moduleLabel),
 		prometheus.GaugeValue,
-		float64(retries))
+		float64(retries),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("snmp_scrape_pdus_returned", "PDUs returned from get, bulkget, and walk.", nil, moduleLabel),
 		prometheus.GaugeValue,
-		float64(len(results.pdus)))
+		float64(len(results.pdus)),
+	)
 
 	oidToPdu := make(map[string]gosnmp.SnmpPDU, len(results.pdus))
 	for _, pdu := range results.pdus {
@@ -436,7 +442,8 @@ func (c Collector) collect(ch chan<- prometheus.Metric, logger *slog.Logger, cli
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("snmp_scrape_duration_seconds", "Total SNMP time scrape took (walk and processing).", nil, moduleLabel),
 		prometheus.GaugeValue,
-		time.Since(start).Seconds())
+		time.Since(start).Seconds(),
+	)
 }
 
 // Collect implements Prometheus.Collector.
@@ -446,7 +453,7 @@ func (c Collector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
 	workerChan := make(chan *NamedModule)
-	for i := 0; i < workerCount; i++ {
+	for i := range workerCount {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -542,9 +549,8 @@ func getPduValue(pdu *gosnmp.SnmpPDU) float64 {
 // parseDateAndTime extracts a UNIX timestamp from an RFC 2579 DateAndTime.
 func parseDateAndTime(pdu *gosnmp.SnmpPDU) (float64, error) {
 	var (
-		v   []byte
-		tz  *time.Location
-		err error
+		v  []byte
+		tz *time.Location
 	)
 	// DateAndTime should be a slice of bytes.
 	switch pduType := pdu.Value.(type) {
@@ -570,9 +576,6 @@ func parseDateAndTime(pdu *gosnmp.SnmpPDU) (float64, error) {
 	default:
 		return 0, fmt.Errorf("invalid DateAndTime length %v", pduLength)
 	}
-	if err != nil {
-		return 0, fmt.Errorf("unable to parse DateAndTime %q, error: %w", v, err)
-	}
 	// Build the date from the various fields and time zone.
 	t := time.Date(
 		int(binary.BigEndian.Uint16(v[0:2])),
@@ -582,7 +585,8 @@ func parseDateAndTime(pdu *gosnmp.SnmpPDU) (float64, error) {
 		int(v[5]),
 		int(v[6]),
 		int(v[7])*1e+8,
-		tz)
+		tz,
+	)
 	return float64(t.Unix()), nil
 }
 
@@ -593,6 +597,15 @@ func parseDateAndTimeWithPattern(metric *config.Metric, pdu *gosnmp.SnmpPDU, met
 		return 0, fmt.Errorf("error parsing date and time %w", err)
 	}
 	return float64(t.Unix()), nil
+}
+
+func parseFloatString(pdu *gosnmp.SnmpPDU, metrics Metrics) (float64, error) {
+	pduValue := pduValueAsString(pdu, "DisplayString", "", metrics)
+	f, err := strconv.ParseFloat(strings.TrimSpace(pduValue), 64)
+	if err != nil {
+		return 0, fmt.Errorf("error parsing string to float: %w", err)
+	}
+	return f, nil
 }
 
 func parseNtpTimestamp(pdu *gosnmp.SnmpPDU) (float64, error) {
@@ -649,6 +662,13 @@ func pduToSamples(indexOids []int, pdu *gosnmp.SnmpPDU, metric *config.Metric, o
 		value, err = parseDateAndTimeWithPattern(metric, pdu, metrics)
 		if err != nil {
 			logger.Debug("Error parsing ParseDateAndTime", "err", err)
+			return []prometheus.Metric{}
+		}
+	case "ParseFloatString":
+		t = prometheus.GaugeValue
+		value, err = parseFloatString(pdu, metrics)
+		if err != nil {
+			logger.Debug("Error parsing ParseFloatString", "err", err)
 			return []prometheus.Metric{}
 		}
 	case "NTPTimeStamp":
@@ -754,10 +774,8 @@ func enumAsInfo(metric *config.Metric, value int, labelnames, labelvalues []stri
 	// If the metric name is already a label (e.g. it is also a table index with
 	// type EnumAsInfo), the enum string is already captured there and we must not
 	// add it again or Prometheus will reject the duplicate label.
-	for _, ln := range labelnames {
-		if ln == metric.Name {
-			return []prometheus.Metric{}
-		}
+	if slices.Contains(labelnames, metric.Name) {
+		return []prometheus.Metric{}
 	}
 	labelnames = append(labelnames, metric.Name)
 	labelvalues = append(labelvalues, state)
@@ -835,10 +853,7 @@ func bits(metric *config.Metric, value any, labelnames, labelvalues []string) []
 // Some routers exclude trailing 0s in responses.
 func splitOid(oid []int, count int) ([]int, []int) {
 	head := make([]int, count)
-	tailCapacity := len(oid) - count
-	if tailCapacity < 0 {
-		tailCapacity = 0
-	}
+	tailCapacity := max(len(oid)-count, 0)
 	tail := make([]int, 0, tailCapacity)
 	for i, v := range oid {
 		if i < count {
@@ -981,18 +996,20 @@ func indexOidsAsString(indexOids []int, typ string, fixedSize int, implied bool,
 		return string(parts), subOid, indexOids
 	case "InetAddressIPv4":
 		subOid, indexOids := splitOid(indexOids, 4)
-		parts := make([]string, 4)
+		var parts [4]byte
 		for i, o := range subOid {
-			parts[i] = strconv.Itoa(o)
+			parts[i] = byte(o)
 		}
-		return strings.Join(parts, "."), subOid, indexOids
+		ipAddr := netip.AddrFrom4(parts)
+		return ipAddr.String(), subOid, indexOids
 	case "InetAddressIPv6":
 		subOid, indexOids := splitOid(indexOids, 16)
-		parts := make([]any, 16)
+		var parts [16]byte
 		for i, o := range subOid {
-			parts[i] = o
+			parts[i] = byte(o)
 		}
-		return fmt.Sprintf("%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X", parts...), subOid, indexOids
+		ipAddr := netip.AddrFrom16(parts)
+		return strings.ToUpper(ipAddr.StringExpanded()), subOid, indexOids
 	case "EnumAsInfo":
 		subOid, indexOids := splitOid(indexOids, 1)
 		value, ok := enumValues[subOid[0]]
